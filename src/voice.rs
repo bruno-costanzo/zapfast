@@ -17,7 +17,8 @@ const BITRATE: i32 = 32_000;
 
 /// Mono samples at `RATE` from an OGG/Opus file.
 pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
+    let bytes = without_stray_first_pages(bytes);
+    let mut reader = ogg::PacketReader::new(Cursor::new(&bytes[..]));
     let mut stream: Option<Stream> = None;
     let mut out = Vec::new();
     let mut scratch = vec![0f32; LONGEST_PACKET];
@@ -25,10 +26,6 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
         let packet = match reader.read_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
-            // A page out of place, such as a second first page in the middle
-            // that some phones write. The reader drops it unchanged and goes
-            // on with the next page, as the phone does.
-            Err(ogg::OggReadError::InvalidData) => continue,
             Err(error) => return Err(format!("bad OGG stream: {error}")),
         };
         let Some(current) = stream.as_mut() else {
@@ -64,6 +61,45 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
         return Err("not an OGG stream".to_owned());
     }
     Ok(out)
+}
+
+/// The OGG file without the beginning-of-stream pages that repeat one of
+/// a stream already begun. Some phones write such a page in the middle of
+/// a voice message; the phone skips it, the `ogg` reader refuses the whole
+/// file. Every other page, malformed ones included, is kept for the reader
+/// to judge.
+fn without_stray_first_pages(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const HEADER: usize = 27;
+    const BEGINS_STREAM: u8 = 0x02;
+    let mut begun = std::collections::HashSet::new();
+    let mut strays = Vec::new();
+    let mut at = 0;
+    while let Some(header) = bytes.get(at..at + HEADER) {
+        if !header.starts_with(b"OggS") {
+            break;
+        }
+        let segments = usize::from(header[26]);
+        let Some(lacing) = bytes.get(at + HEADER..at + HEADER + segments) else {
+            break;
+        };
+        let end = at + HEADER + segments + lacing.iter().map(|&l| usize::from(l)).sum::<usize>();
+        let serial = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
+        if header[5] & BEGINS_STREAM != 0 && !begun.insert(serial) {
+            strays.push(at..end.min(bytes.len()));
+        }
+        at = end;
+    }
+    if strays.is_empty() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut from = 0;
+    for stray in strays {
+        kept.extend_from_slice(&bytes[from..stray.start]);
+        from = stray.end;
+    }
+    kept.extend_from_slice(&bytes[from..]);
+    std::borrow::Cow::Owned(kept)
 }
 
 struct Stream {
@@ -303,6 +339,47 @@ mod tests {
             "{} samples back",
             decoded.len()
         );
+    }
+
+    /// Only a repeated first page is skipped: a page of a stream that never
+    /// began is still refused, instead of returning a cut clip as whole.
+    #[test]
+    fn a_page_out_of_place_is_still_refused() {
+        let mut bytes = encode(&tone(1.0)).expect("encodes");
+        let second = 27
+            + usize::from(bytes[26])
+            + bytes[27..27 + usize::from(bytes[26])]
+                .iter()
+                .map(|&lace| usize::from(lace))
+                .sum::<usize>();
+        // Give the second page a serial no first page began, with its
+        // checksum made again so the reader judges the page, not the hash.
+        let end = second
+            + 27
+            + usize::from(bytes[second + 26])
+            + bytes[second + 27..second + 27 + usize::from(bytes[second + 26])]
+                .iter()
+                .map(|&lace| usize::from(lace))
+                .sum::<usize>();
+        bytes[second + 14] ^= 0xFF;
+        bytes[second + 22..second + 26].fill(0);
+        let crc = ogg_crc(&bytes[second..end]);
+        bytes[second + 22..second + 26].copy_from_slice(&crc.to_le_bytes());
+        let error = decode(&bytes).expect_err("refused");
+        assert!(error.contains("Constraint violated"), "{error}");
+    }
+
+    /// The OGG page checksum: CRC-32, polynomial 0x04c11db7, unreflected.
+    fn ogg_crc(page: &[u8]) -> u32 {
+        page.iter().fold(0u32, |crc, &byte| {
+            (0..8).fold(crc ^ (u32::from(byte) << 24), |crc, _| {
+                if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04c1_1db7
+                } else {
+                    crc << 1
+                }
+            })
+        })
     }
 
     #[test]
