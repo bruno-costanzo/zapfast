@@ -25,6 +25,10 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
         let packet = match reader.read_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
+            // A page out of place, such as a second first page in the middle
+            // that some phones write. The reader drops it unchanged and goes
+            // on with the next page, as the phone does.
+            Err(ogg::OggReadError::InvalidData) => continue,
             Err(error) => return Err(format!("bad OGG stream: {error}")),
         };
         let Some(current) = stream.as_mut() else {
@@ -266,6 +270,39 @@ mod tests {
         let end = decoded.len().min(original.len());
         let (before, after) = (rms(&original[4800..end]), rms(&decoded[4800..end]));
         assert!((before - after).abs() < 0.08, "{before} in, {after} out");
+    }
+
+    /// Some phones write a second beginning-of-stream page in the middle of
+    /// a voice message. The phone skips it; the `ogg` reader refuses it,
+    /// and the whole message failed to play.
+    #[test]
+    fn a_stray_first_page_in_the_middle_is_skipped() {
+        let original = tone(1.0);
+        let bytes = encode(&original).expect("encodes");
+        let mut pages = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let segments = usize::from(bytes[at + 26]);
+            let body: usize = bytes[at + 27..at + 27 + segments]
+                .iter()
+                .map(|&lace| usize::from(lace))
+                .sum();
+            let end = at + 27 + segments + body;
+            pages.push(&bytes[at..end]);
+            at = end;
+        }
+        assert!(pages.len() > 3, "{} pages", pages.len());
+        let mut stray = pages[..3].concat();
+        stray.extend_from_slice(pages[0]);
+        stray.extend(pages[3..].concat());
+
+        let decoded = decode(&stray).expect("decodes");
+        let drift = decoded.len() as i64 - original.len() as i64;
+        assert!(
+            drift.abs() <= FRAME as i64,
+            "{} samples back",
+            decoded.len()
+        );
     }
 
     #[test]
