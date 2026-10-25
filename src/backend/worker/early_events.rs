@@ -107,12 +107,19 @@ impl EarlyEvents {
 
     /// Whether the phone read this message before we had it, and if so
     /// whether it played it too.
+    /// A privacy id's chat moved under its phone number can leave two
+    /// entries for one message; both are taken, and a play in either counts.
     pub(super) fn take_read(&mut self, chat: &str, id: &str) -> Option<bool> {
-        let at = self
-            .reads
-            .iter()
-            .position(|read| read.chat == chat && read.id == id)?;
-        self.reads.remove(at).map(|read| read.played)
+        let mut found = None;
+        self.reads.retain(|read| {
+            if read.chat == chat && read.id == id {
+                found = Some(found.unwrap_or(false) || read.played);
+                false
+            } else {
+                true
+            }
+        });
+        found
     }
 
     /// The reactions waiting for this message, oldest first.
@@ -249,6 +256,19 @@ mod tests {
         early.wait_read("chat", "voice", false);
         assert_eq!(early.take_read("chat", "voice"), Some(true));
         assert_eq!(early.take_read("chat", "voice"), None);
+    }
+
+    #[test]
+    fn a_play_under_a_privacy_id_joins_the_read_under_the_number() {
+        let mut early = EarlyEvents::default();
+        early.wait_read("15550000001@s.whatsapp.net", "voice", false);
+        early.wait_read("1001@lid", "voice", true);
+        early.rekey("1001@lid", "15550000001@s.whatsapp.net");
+        assert_eq!(
+            early.take_read("15550000001@s.whatsapp.net", "voice"),
+            Some(true)
+        );
+        assert_eq!(early.take_read("15550000001@s.whatsapp.net", "voice"), None);
     }
 
     #[test]

@@ -5762,6 +5762,12 @@ impl Worker {
                 let mut existed = false;
                 let mut live_location_changed = false;
                 let existing = self.archive.message(&id, &row.id).ok().flatten();
+                // A transcript already on screen is not paged again, so a
+                // status history moves forward, such as a voice message the
+                // phone played, is sent to it.
+                let status_advanced = existing
+                    .as_ref()
+                    .is_some_and(|existing| existing.status < row.status);
                 // What the info panel listed for this row before it lands,
                 // so a change to its pictures, documents or links is told.
                 let before = existing.as_ref().map(|existing| existing.content.clone());
@@ -5792,7 +5798,7 @@ impl Worker {
                     failed += 1;
                     log::warn!("could not store a history message: {error}");
                 } else {
-                    if live_location_changed {
+                    if live_location_changed || status_advanced {
                         self.emit_message(&id, &row.id);
                     }
                     self.retire_local_call_twins(&row);
@@ -19844,6 +19850,45 @@ mod receipt_tests {
         assert_eq!(parsed(Status::PLAYED), Delivery::Played);
         assert_eq!(parsed(Status::READ), Delivery::None);
         assert_eq!(parsed(Status::DELIVERY_ACK), Delivery::None);
+    }
+
+    #[test]
+    fn history_tells_the_transcript_of_a_voice_message_played_since() {
+        use wa::web_message_info::Status;
+        let (mut worker, events, _inbox, _wa) = worker();
+        let entry = |status| {
+            let mut entry = history_entry(
+                PEER,
+                "voice",
+                false,
+                None,
+                {
+                    let mut proto = wa::Message::default();
+                    proto.audio_message = MessageField::some({
+                        let mut proto = wa::message::AudioMessage::default();
+                        proto.ptt = Some(true);
+                        proto
+                    });
+                    proto
+                },
+                Vec::new(),
+                None,
+            );
+            entry.message.as_option_mut().unwrap().status = Some(status);
+            entry
+        };
+        file_history_entries(&mut worker, vec![entry(Status::DELIVERY_ACK)]);
+        while events.try_recv().is_ok() {}
+        // A replay that says the phone played it updates the row on screen.
+        file_history_entries(&mut worker, vec![entry(Status::PLAYED)]);
+        let told = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, Event::MessageUpdated(message)
+                if message.id == "voice" && message.status == Delivery::Played)
+        });
+        assert!(
+            told,
+            "the played voice message was not sent to the transcript"
+        );
     }
 
     #[test]
